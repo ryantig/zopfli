@@ -22,6 +22,7 @@ Author: jyrki.alakuijala@gmail.com (Jyrki Alakuijala)
 #include "deflate.h"
 #include "gzip_container.h"
 #include "zlib_container.h"
+#include "profile.h"
 
 #include <assert.h>
 
@@ -39,4 +40,5 @@ void ZopfliCompress(const ZopfliOptions* options, ZopfliFormat output_type,
   } else {
     assert(0);
   }
+  PROFILE_PRINT();
 }

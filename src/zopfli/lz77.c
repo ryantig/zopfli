@@ -20,10 +20,22 @@ Author: jyrki.alakuijala@gmail.com (Jyrki Alakuijala)
 #include "lz77.h"
 #include "symbols.h"
 #include "util.h"
+#include "profile.h"
+#include "simd.h"
 
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+#ifdef PROFILE_ZOPFLI
+/* Define profiling counters */
+unsigned long long profile_getmatch_calls = 0;
+unsigned long long profile_getmatch_time_us = 0;
+unsigned long long profile_findlongest_calls = 0;
+unsigned long long profile_findlongest_time_us = 0;
+unsigned long long profile_hash_calls = 0;
+unsigned long long profile_hash_time_us = 0;
+#endif
 
 void ZopfliInitLZ77Store(const unsigned char* data, ZopfliLZ77Store* store) {
   store->size = 0;
@@ -294,21 +306,29 @@ match is the earlier position to compare.
 end is the last possible byte, beyond which to stop looking.
 safe_end is a few (8) bytes before end, for comparing multiple bytes at once.
 */
-static const unsigned char* GetMatch(const unsigned char* scan,
-                                     const unsigned char* match,
+static const unsigned char* GetMatch(const unsigned char* __restrict__ scan,
+                                     const unsigned char* __restrict__ match,
                                      const unsigned char* end,
                                      const unsigned char* safe_end) {
+  PROFILE_START(getmatch);
 
+#if ZOPFLI_HAS_SIMD
+  /* Use SIMD-optimized version */
+  const unsigned char* result = GetMatch_SIMD(scan, match, end, safe_end);
+  PROFILE_END(getmatch);
+  return result;
+#else
+  /* Fallback to scalar version */
   if (sizeof(size_t) == 8) {
     /* 8 checks at once per array bounds check (size_t is 64-bit). */
-    while (scan < safe_end && *((size_t*)scan) == *((size_t*)match)) {
+    while (scan < safe_end && *((const size_t*)scan) == *((const size_t*)match)) {
       scan += 8;
       match += 8;
     }
   } else if (sizeof(unsigned int) == 4) {
     /* 4 checks at once per array bounds check (unsigned int is 32-bit). */
     while (scan < safe_end
-        && *((unsigned int*)scan) == *((unsigned int*)match)) {
+        && *((const unsigned int*)scan) == *((const unsigned int*)match)) {
       scan += 4;
       match += 4;
     }
@@ -327,7 +347,9 @@ static const unsigned char* GetMatch(const unsigned char* scan,
     scan++; match++;
   }
 
+  PROFILE_END(getmatch);
   return scan;
+#endif
 }
 
 #ifdef ZOPFLI_LONGEST_MATCH_CACHE
@@ -405,9 +427,10 @@ static void StoreInLongestMatchCache(ZopfliBlockState* s,
 #endif
 
 void ZopfliFindLongestMatch(ZopfliBlockState* s, const ZopfliHash* h,
-    const unsigned char* array,
+    const unsigned char* __restrict__ array,
     size_t pos, size_t size, size_t limit,
-    unsigned short* sublen, unsigned short* distance, unsigned short* length) {
+    unsigned short* __restrict__ sublen, unsigned short* __restrict__ distance, unsigned short* __restrict__ length) {
+  PROFILE_START(findlongest);
   unsigned short hpos = pos & ZOPFLI_WINDOW_MASK, p, pp;
   unsigned short bestdist = 0;
   unsigned short bestlength = 1;
@@ -421,14 +444,15 @@ void ZopfliFindLongestMatch(ZopfliBlockState* s, const ZopfliHash* h,
 
   unsigned dist = 0;  /* Not unsigned short on purpose. */
 
-  int* hhead = h->head;
-  unsigned short* hprev = h->prev;
-  int* hhashval = h->hashval;
+  int* __restrict__ hhead = h->head;
+  unsigned short* __restrict__ hprev = h->prev;
+  int* __restrict__ hhashval = h->hashval;
   int hval = h->val;
 
 #ifdef ZOPFLI_LONGEST_MATCH_CACHE
   if (TryGetFromLongestMatchCache(s, pos, &limit, sublen, distance, length)) {
     assert(pos + *length <= size);
+    PROFILE_END(findlongest);
     return;
   }
 #endif
@@ -442,6 +466,7 @@ void ZopfliFindLongestMatch(ZopfliBlockState* s, const ZopfliHash* h,
        try. */
     *length = 0;
     *distance = 0;
+    PROFILE_END(findlongest);
     return;
   }
 
@@ -473,6 +498,11 @@ void ZopfliFindLongestMatch(ZopfliBlockState* s, const ZopfliHash* h,
       assert(dist <= pos);
       scan = &array[pos];
       match = &array[pos - dist];
+
+      /* Prefetch next hash chain entry for better cache performance */
+      if (p < ZOPFLI_WINDOW_SIZE) {
+        __builtin_prefetch(&array[pos - (p < pp ? pp - p : ((ZOPFLI_WINDOW_SIZE - p) + pp))], 0, 0);
+      }
 
       /* Testing the byte at position bestlength first, goes slightly faster. */
       if (pos + bestlength >= size
@@ -539,6 +569,7 @@ void ZopfliFindLongestMatch(ZopfliBlockState* s, const ZopfliHash* h,
   *distance = bestdist;
   *length = bestlength;
   assert(pos + *length <= size);
+  PROFILE_END(findlongest);
 }
 
 void ZopfliLZ77Greedy(ZopfliBlockState* s, const unsigned char* in,
